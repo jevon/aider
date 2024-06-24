@@ -1,5 +1,4 @@
 import os
-import os.path
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -15,8 +14,10 @@ from pygments.util import ClassNotFound
 from rich.console import Console
 from rich.text import Text
 
+from .dump import dump  # noqa: F401
 
-class FileContentCompleter(Completer):
+
+class AutoCompleter(Completer):
     def __init__(self, root, rel_fnames, addable_rel_fnames, commands):
         self.commands = commands
         self.addable_rel_fnames = addable_rel_fnames
@@ -30,6 +31,7 @@ class FileContentCompleter(Completer):
         self.fname_to_rel_fnames = fname_to_rel_fnames
 
         self.words = set()
+
         for rel_fname in addable_rel_fnames:
             self.words.add(rel_fname)
 
@@ -55,6 +57,7 @@ class FileContentCompleter(Completer):
         if text[0] == "/":
             if len(words) == 1 and not text[-1].isspace():
                 candidates = self.commands.get_commands()
+                candidates = [(cmd, cmd) for cmd in candidates]
             else:
                 for completion in self.commands.get_command_completions(words[0][1:], words[-1]):
                     yield completion
@@ -62,21 +65,27 @@ class FileContentCompleter(Completer):
         else:
             candidates = self.words
             candidates.update(set(self.fname_to_rel_fnames))
+            candidates = [(word, f"`{word}`") for word in candidates]
 
         last_word = words[-1]
-        for word in candidates:
-            if word.lower().startswith(last_word.lower()):
-                rel_fnames = self.fname_to_rel_fnames.get(word, [])
+        for word_match, word_insert in candidates:
+            if word_match.lower().startswith(last_word.lower()):
+                rel_fnames = self.fname_to_rel_fnames.get(word_match, [])
                 if rel_fnames:
                     for rel_fname in rel_fnames:
                         yield Completion(
                             f"`{rel_fname}`", start_position=-len(last_word), display=rel_fname
                         )
                 else:
-                    yield Completion(f"`{word}`", start_position=-len(last_word), display=word)
+                    yield Completion(
+                        word_insert, start_position=-len(last_word), display=word_match
+                    )
 
 
 class InputOutput:
+    num_error_outputs = 0
+    num_user_asks = 0
+
     def __init__(
         self,
         pretty=True,
@@ -96,10 +105,12 @@ class InputOutput:
         self.user_input_color = user_input_color if pretty else None
         self.tool_output_color = tool_output_color if pretty else None
         self.tool_error_color = tool_error_color if pretty else None
+
         self.input = input
         self.output = output
         self.pretty = pretty
         self.yes = yes
+
         self.input_history_file = input_history_file
         if chat_history_file is not None:
             self.chat_history_file = Path(chat_history_file)
@@ -141,9 +152,7 @@ class InputOutput:
             style = None
 
         while True:
-            completer_instance = FileContentCompleter(
-                root, rel_fnames, addable_rel_fnames, commands
-            )
+            completer_instance = AutoCompleter(root, rel_fnames, addable_rel_fnames, commands)
             if multiline_input:
                 show = ". "
 
@@ -165,10 +174,12 @@ class InputOutput:
             session = PromptSession(**session_kwargs)
             line = session.prompt()
 
-            if line.strip() == "{" and not multiline_input:
+            if line and line[0] == "{" and not multiline_input:
                 multiline_input = True
+                inp += line[1:] + "\n"
                 continue
-            elif line.strip() == "}" and multiline_input:
+            elif line and line[-1] == "}" and multiline_input:
+                inp += line[:-1] + "\n"
                 break
             elif multiline_input:
                 inp += line + "\n"
@@ -177,7 +188,10 @@ class InputOutput:
                 break
 
         print()
+        self.user_input(inp)
+        return inp
 
+    def user_input(self, inp):
         prefix = "####"
         if inp:
             hist = inp.splitlines()
@@ -190,8 +204,6 @@ class InputOutput:
 {prefix} {hist}"""
         self.append_chat_history(hist, linebreak=True)
 
-        return inp
-
     # OUTPUT
 
     def ai_output(self, content):
@@ -199,30 +211,44 @@ class InputOutput:
         self.append_chat_history(hist)
 
     def confirm_ask(self, question, default="y"):
-        if self.yes:
+        self.num_user_asks += 1
+
+        if self.yes is True:
             res = "yes"
+        elif self.yes is False:
+            res = "no"
         else:
             res = prompt(question + " ", default=default)
 
         hist = f"{question.strip()} {res.strip()}"
         self.append_chat_history(hist, linebreak=True, blockquote=True)
+        if self.yes in (True, False):
+            self.tool_output(hist)
 
         if not res or not res.strip():
             return
         return res.strip().lower().startswith("y")
 
     def prompt_ask(self, question, default=None):
-        if self.yes:
+        self.num_user_asks += 1
+
+        if self.yes is True:
             res = "yes"
+        elif self.yes is False:
+            res = "no"
         else:
             res = prompt(question + " ", default=default)
 
         hist = f"{question.strip()} {res.strip()}"
         self.append_chat_history(hist, linebreak=True, blockquote=True)
+        if self.yes in (True, False):
+            self.tool_output(hist)
 
         return res
 
     def tool_error(self, message):
+        self.num_error_outputs += 1
+
         if message.strip():
             hist = f"{message.strip()}"
             self.append_chat_history(hist, linebreak=True, blockquote=True)

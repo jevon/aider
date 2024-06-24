@@ -3,6 +3,7 @@ import shutil
 import tempfile
 from unittest import TestCase
 
+from aider import models
 from aider.commands import Commands
 from aider.io import InputOutput
 
@@ -20,9 +21,9 @@ class TestCommands(TestCase):
     def test_cmd_add(self):
         # Initialize the Commands and InputOutput objects
         io = InputOutput(pretty=False, yes=True)
-        from aider.coder import Coder
+        from aider.coders import Coder
 
-        coder = Coder(io, openai_api_key="deadbeef")
+        coder = Coder.create(models.GPT35, None, io, openai_api_key="deadbeef")
         commands = Commands(io, coder)
 
         # Call the cmd_add method with 'foo.txt' and 'bar.txt' as a single string

@@ -4,7 +4,8 @@ import sys
 import configargparse
 import git
 
-from aider.coder import Coder
+from aider import __version__, models
+from aider.coders import Coder
 from aider.io import InputOutput
 
 
@@ -29,11 +30,18 @@ def main(args=None, input=None, output=None):
         default_config_files.insert(0, os.path.join(git_root, ".aider.conf.yml"))
 
     parser = configargparse.ArgumentParser(
-        description="aider - chat with GPT about your code",
+        description="aider is GPT powered coding in your terminal",
         add_config_file_help=True,
         default_config_files=default_config_files,
         config_file_parser_class=configargparse.YAMLConfigFileParser,
         auto_env_var_prefix="AIDER_",
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="Show the version number and exit",
     )
 
     parser.add_argument(
@@ -75,15 +83,21 @@ def main(args=None, input=None, output=None):
     parser.add_argument(
         "--model",
         metavar="MODEL",
-        default="gpt-4",
-        help="Specify the model to use for the main chat (default: gpt-4)",
+        default=models.GPT4.name,
+        help=f"Specify the model to use for the main chat (default: {models.GPT4.name})",
     )
     parser.add_argument(
         "-3",
         action="store_const",
         dest="model",
-        const="gpt-3.5-turbo",
-        help="Use gpt-3.5-turbo model for the main chat (not advised)",
+        const=models.GPT35_16k.name,
+        help=f"Use {models.GPT35_16k.name} model for the main chat (gpt-4 is better)",
+    )
+    parser.add_argument(
+        "--edit-format",
+        metavar="EDIT_FORMAT",
+        default=None,
+        help="Specify what edit format GPT should use (default depends on model)",
     )
     parser.add_argument(
         "--pretty",
@@ -96,6 +110,20 @@ def main(args=None, input=None, output=None):
         action="store_false",
         dest="pretty",
         help="Disable pretty, colorized output",
+    )
+    parser.add_argument(
+        "--no-stream",
+        action="store_false",
+        dest="stream",
+        default=True,
+        help="Disable streaming responses",
+    )
+    parser.add_argument(
+        "--no-git",
+        action="store_false",
+        dest="git",
+        default=True,
+        help="Do not look for a git repo",
     )
     parser.add_argument(
         "--user-input-color",
@@ -113,6 +141,11 @@ def main(args=None, input=None, output=None):
         help="Set the color for tool error messages (default: red)",
     )
     parser.add_argument(
+        "--assistant-output-color",
+        default="blue",
+        help="Set the color for assistant output (default: blue)",
+    )
+    parser.add_argument(
         "--apply",
         metavar="FILE",
         help="Apply the changes from the given file instead of running the chat (debug)",
@@ -122,33 +155,39 @@ def main(args=None, input=None, output=None):
         action="store_true",
         dest="auto_commits",
         default=True,
-        help="Enable auto commit of changes (default: True)",
+        help="Enable auto commit of GPT changes (default: True)",
     )
 
     parser.add_argument(
         "--no-auto-commits",
         action="store_false",
         dest="auto_commits",
-        help="Disable auto commit of changes",
+        help="Disable auto commit of GPT changes (implies --no-dirty-commits)",
     )
     parser.add_argument(
         "--dirty-commits",
         action="store_true",
         dest="dirty_commits",
-        help="Enable dirty commit of changes",
+        help="Enable commits when repo is found dirty",
         default=True,
     )
     parser.add_argument(
         "--no-dirty-commits",
         action="store_false",
         dest="dirty_commits",
-        help="Disable dirty commit of changes",
+        help="Disable commits when repo is found dirty",
     )
     parser.add_argument(
         "--openai-api-key",
         metavar="OPENAI_API_KEY",
         help="Specify the OpenAI API key",
         env_var="OPENAI_API_KEY",
+    )
+    parser.add_argument(
+        "--openai-api-base",
+        metavar="OPENAI_API_BASE",
+        default="https://api.openai.com/v1",
+        help="Specify the OpenAI API base endpoint (default: https://api.openai.com/v1)",
     )
     parser.add_argument(
         "--dry-run",
@@ -163,21 +202,16 @@ def main(args=None, input=None, output=None):
         default=False,
     )
     parser.add_argument(
-        "--ctags",
-        type=lambda x: (str(x).lower() == "true"),
-        nargs="?",
-        const=True,
-        default=None,
-        help=(
-            "Add ctags to the chat to help GPT understand the codebase (default: check for ctags"
-            " executable)"
-        ),
+        "--map-tokens",
+        type=int,
+        default=1024,
+        help="Max number of tokens to use for repo map, use 0 to disable (default: 1024)",
     )
     parser.add_argument(
         "--yes",
         action="store_true",
         help="Always say yes to every confirmation",
-        default=False,
+        default=None,
     )
     parser.add_argument(
         "-v",
@@ -185,6 +219,13 @@ def main(args=None, input=None, output=None):
         action="store_true",
         help="Enable verbose output",
         default=False,
+    )
+    parser.add_argument(
+        "--message",
+        "--msg",
+        "-m",
+        metavar="COMMAND",
+        help="Specify a single message to send GPT, process reply then exit (disables chat mode)",
     )
     args = parser.parse_args(args)
 
@@ -213,18 +254,26 @@ def main(args=None, input=None, output=None):
         io.tool_error("No OpenAI API key provided. Use --openai-api-key or env OPENAI_API_KEY.")
         return 1
 
-    coder = Coder(
+    main_model = models.Model(args.model)
+
+    coder = Coder.create(
+        main_model,
+        args.edit_format,
         io,
-        main_model=args.model,
+        args.openai_api_key,
+        args.openai_api_base,
+        ##
         fnames=args.files,
         pretty=args.pretty,
         show_diffs=args.show_diffs,
         auto_commits=args.auto_commits,
         dirty_commits=args.dirty_commits,
         dry_run=args.dry_run,
-        use_ctags=args.ctags,
+        map_tokens=args.map_tokens,
         verbose=args.verbose,
-        openai_api_key=args.openai_api_key,
+        assistant_output_color=args.assistant_output_color,
+        stream=args.stream,
+        use_git=args.git,
     )
 
     if args.dirty_commits:
@@ -233,11 +282,15 @@ def main(args=None, input=None, output=None):
     if args.apply:
         with open(args.apply, "r") as f:
             content = f.read()
-        coder.update_files(content, inp="")
+        coder.apply_updates(content)
         return
 
     io.tool_output("Use /help to see in-chat commands.")
-    coder.run()
+    if args.message:
+        io.tool_output()
+        coder.run(with_message=args.message)
+    else:
+        coder.run()
 
 
 if __name__ == "__main__":
